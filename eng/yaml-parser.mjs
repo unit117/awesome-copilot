@@ -1,6 +1,7 @@
-// YAML parser for collection files and frontmatter parsing using vfile-matter
+// YAML parser for frontmatter parsing using vfile-matter
 import fs from "fs";
-import yaml from "js-yaml";
+import * as yaml from "js-yaml";
+import path from "path";
 import { VFile } from "vfile";
 import { matter } from "vfile-matter";
 
@@ -14,23 +15,24 @@ function safeFileOperation(operation, filePath, defaultValue = null) {
 }
 
 /**
- * Parse a collection YAML file (.collection.yml)
- * Collections are pure YAML files without frontmatter delimiters
- * @param {string} filePath - Path to the collection file
- * @returns {object|null} Parsed collection object or null on error
+ * Decide whether a symlinked entry should be left out of a bundled asset list.
+ *
+ * Directory symlinks are skipped because following one can walk outside the
+ * folder or form a cycle. Broken links are skipped too. File symlinks are kept:
+ * plugin materialization dereferences them, so they really are bundled content.
+ *
+ * @param {string} filePath - Path to the symlinked entry
+ * @returns {boolean} True when the entry should be skipped
  */
-function parseCollectionYaml(filePath) {
-  return safeFileOperation(
-    () => {
-      const content = fs.readFileSync(filePath, "utf8");
-
-      // Collections are pure YAML files, parse directly with js-yaml
-      return yaml.load(content, { schema: yaml.JSON_SCHEMA });
-    },
-    filePath,
-    null
-  );
+function skipsAsBundledAsset(filePath) {
+  try {
+    return fs.statSync(filePath).isDirectory();
+  } catch {
+    return true;
+  }
 }
+
+const BUILD_OUTPUT_DIRECTORIES = new Set(["bin", "obj"]);
 
 /**
  * Parse frontmatter from a markdown file using vfile-matter
@@ -113,35 +115,214 @@ function extractMcpServers(filePath) {
 }
 
 /**
- * Extract full MCP server configs from an agent file
- * @param {string} filePath - Path to the agent file
- * @returns {Array<{name:string,type?:string,command?:string,args?:string[],url?:string,headers?:object}>}
+ * Parse SKILL.md frontmatter and list bundled assets in a skill folder
+ * @param {string} skillPath - Path to skill folder
+ * @returns {object|null} Skill metadata with name, description, and assets array
  */
-function extractMcpServerConfigs(filePath) {
-  const metadata = extractAgentMetadata(filePath);
-  if (!metadata || !metadata.mcpServers) return [];
-  return Object.entries(metadata.mcpServers).map(([name, cfg]) => {
-    // Ensure we don't mutate original cfg
-    const copy = { ...cfg };
-    return {
-      name,
-      type: typeof copy.type === "string" ? copy.type : undefined,
-      command: typeof copy.command === "string" ? copy.command : undefined,
-      args: Array.isArray(copy.args) ? copy.args : undefined,
-      url: typeof copy.url === "string" ? copy.url : undefined,
-      headers:
-        typeof copy.headers === "object" && copy.headers !== null
-          ? copy.headers
-          : undefined,
-    };
-  });
+function parseSkillMetadata(skillPath) {
+  return safeFileOperation(
+    () => {
+      const skillFile = path.join(skillPath, "SKILL.md");
+      if (!fs.existsSync(skillFile)) {
+        return null;
+      }
+
+      const frontmatter = parseFrontmatter(skillFile);
+
+      // Validate required fields
+      if (!frontmatter?.name || !frontmatter?.description) {
+        console.warn(
+          `Invalid skill at ${skillPath}: missing name or description in frontmatter`
+        );
+        return null;
+      }
+
+      // List bundled assets (all files except SKILL.md), recursing through subdirectories.
+      // Directory symlinks are skipped: following one can escape the skill folder.
+      const getAllFiles = (dirPath, arrayOfFiles = []) => {
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+
+        entries.forEach((entry) => {
+          const filePath = path.join(dirPath, entry.name);
+          if (entry.isDirectory()) {
+            if (BUILD_OUTPUT_DIRECTORIES.has(entry.name)) return;
+            arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
+          } else if (
+            !entry.isSymbolicLink() ||
+            !skipsAsBundledAsset(filePath)
+          ) {
+            const relativePath = path.relative(skillPath, filePath);
+            if (relativePath !== "SKILL.md") {
+              // Normalize path separators to forward slashes for cross-platform consistency
+              arrayOfFiles.push(relativePath.replace(/\\/g, "/"));
+            }
+          }
+        });
+
+        return arrayOfFiles;
+      };
+
+      const assets = getAllFiles(skillPath).sort();
+
+      return {
+        name: frontmatter.name,
+        description: frontmatter.description,
+        assets,
+        path: skillPath,
+      };
+    },
+    skillPath,
+    null
+  );
+}
+
+/**
+ * Parse hook metadata from a hook folder (similar to skills)
+ * @param {string} hookPath - Path to the hook folder
+ * @returns {object|null} Hook metadata or null on error
+ */
+function parseHookMetadata(hookPath) {
+  return safeFileOperation(
+    () => {
+      const readmeFile = path.join(hookPath, "README.md");
+      if (!fs.existsSync(readmeFile)) {
+        return null;
+      }
+
+      const frontmatter = parseFrontmatter(readmeFile);
+
+      // Validate required fields
+      if (!frontmatter?.name || !frontmatter?.description) {
+        console.warn(
+          `Invalid hook at ${hookPath}: missing name or description in frontmatter`
+        );
+        return null;
+      }
+
+      // Extract hook events from hooks.json if it exists
+      let hookEvents = [];
+      const hooksJsonPath = path.join(hookPath, "hooks.json");
+      if (fs.existsSync(hooksJsonPath)) {
+        try {
+          const hooksJsonContent = fs.readFileSync(hooksJsonPath, "utf8");
+          const hooksConfig = JSON.parse(hooksJsonContent);
+          // Extract all hook event names from the hooks object
+          if (hooksConfig.hooks && typeof hooksConfig.hooks === "object") {
+            hookEvents = Object.keys(hooksConfig.hooks);
+          }
+        } catch (error) {
+          console.warn(
+            `Failed to parse hooks.json at ${hookPath}: ${error.message}`
+          );
+        }
+      }
+
+      // List bundled assets (all files except README.md), recursing through subdirectories.
+      // Directory symlinks are skipped: following one can escape the hook folder.
+      const getAllFiles = (dirPath, arrayOfFiles = []) => {
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+
+        entries.forEach((entry) => {
+          const filePath = path.join(dirPath, entry.name);
+          if (entry.isDirectory()) {
+            arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
+          } else if (
+            !entry.isSymbolicLink() ||
+            !skipsAsBundledAsset(filePath)
+          ) {
+            const relativePath = path.relative(hookPath, filePath);
+            if (relativePath !== "README.md") {
+              // Normalize path separators to forward slashes for cross-platform consistency
+              arrayOfFiles.push(relativePath.replace(/\\/g, "/"));
+            }
+          }
+        });
+
+        return arrayOfFiles;
+      };
+
+      const assets = getAllFiles(hookPath).sort();
+
+      return {
+        name: frontmatter.name,
+        description: frontmatter.description,
+        hooks: hookEvents,
+        tags: frontmatter.tags || [],
+        assets,
+        path: hookPath,
+      };
+    },
+    hookPath,
+    null
+  );
+}
+
+/**
+ * Parse workflow metadata from a standalone .md workflow file
+ * @param {string} filePath - Path to the workflow .md file
+ * @returns {object|null} Workflow metadata or null on error
+ */
+function parseWorkflowMetadata(filePath) {
+  return safeFileOperation(
+    () => {
+      if (!fs.existsSync(filePath)) {
+        return null;
+      }
+
+      const frontmatter = parseFrontmatter(filePath);
+
+      // Validate required fields
+      if (!frontmatter?.name || !frontmatter?.description) {
+        console.warn(
+          `Invalid workflow at ${filePath}: missing name or description in frontmatter`
+        );
+        return null;
+      }
+
+      // Extract triggers from the 'on' field (top-level keys)
+      const onField = frontmatter.on;
+      const triggers = [];
+      if (onField && typeof onField === "object") {
+        triggers.push(...Object.keys(onField));
+      } else if (typeof onField === "string") {
+        triggers.push(onField);
+      }
+
+      return {
+        name: frontmatter.name,
+        description: frontmatter.description,
+        triggers,
+        path: filePath,
+      };
+    },
+    filePath,
+    null
+  );
+}
+
+/**
+ * Parse a generic YAML file (used for tools.yml and other config files)
+ * @param {string} filePath - Path to the YAML file
+ * @returns {object|null} Parsed YAML object or null on error
+ */
+function parseYamlFile(filePath) {
+  return safeFileOperation(
+    () => {
+      const content = fs.readFileSync(filePath, "utf8");
+      return yaml.load(content, { schema: yaml.JSON_SCHEMA });
+    },
+    filePath,
+    null
+  );
 }
 
 export {
-  parseCollectionYaml,
-  parseFrontmatter,
   extractAgentMetadata,
   extractMcpServers,
-  extractMcpServerConfigs,
+  parseFrontmatter,
+  parseHookMetadata,
+  parseSkillMetadata,
+  parseWorkflowMetadata,
+  parseYamlFile,
   safeFileOperation,
 };

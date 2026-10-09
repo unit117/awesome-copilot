@@ -1,5 +1,6 @@
 ---
 description: "Address PR comments"
+name: 'Universal PR Comment Addresser'
 tools:
   [
     "changes",
@@ -23,7 +24,7 @@ tools:
     "usages",
     "vscodeAPI",
     "microsoft.docs.mcp",
-    "github",
+    "github"
   ]
 ---
 
